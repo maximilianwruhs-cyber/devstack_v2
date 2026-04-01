@@ -1,0 +1,120 @@
+# ═══════════════════════════════════════════════════════════════════════
+#  🏛️ Sovereign Software Factory — Docker Compose Stack
+#  Orchestrates: AOS Gateway, TurboQuant GPU Engine, pgvector RAG DB
+# ═══════════════════════════════════════════════════════════════════════
+#
+#  Usage:
+#    docker compose up -d                     # Start all services
+#    docker compose up -d aos turboquant      # Start specific services
+#    docker compose logs -f aos               # Tail AOS logs
+#    docker compose down                      # Stop everything
+#
+# ═══════════════════════════════════════════════════════════════════════
+
+services:
+  # ─── AOS Gateway (FastAPI — port 8000) ──────────────────────────────
+  aos:
+    build:
+      context: ./AOS
+      dockerfile: Dockerfile
+    container_name: aos-gateway
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - AOS_VAULT_PATH=/vault/Evaluations
+      - AOS_DATA_DIR=/data
+      # Point AOS at the TurboQuant container (internal DNS)
+      - AOS_BACKEND_URL=http://turboquant:1235/v1
+      - AOS_API_KEY=${AOS_API_KEY:-}
+    volumes:
+      # Obsidian Vault — shared stigmergic memory
+      - ./Obsidian_Vault:/vault
+      # Benchmark data persistence
+      - aos-data:/data
+      # Intel RAPL energy counters (host passthrough)
+      - /sys/class/powercap:/sys/class/powercap:ro
+    depends_on:
+      pgvector:
+        condition: service_healthy
+    networks:
+      - sovereign-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # ─── TurboQuant GPU Engine (llama-server — port 1235) ───────────────
+  turboquant:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    container_name: turboquant-engine
+    restart: unless-stopped
+    ports:
+      - "1235:1235"
+    environment:
+      - TURBO_LAYER_ADAPTIVE=7
+    volumes:
+      # Mount your local models directory
+      - ${MODELS_DIR:-/home/maximilian-wruhs/.lmstudio/models}:/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # Default: serve the model specified in .env
+    # Override with: docker compose run turboquant -m /models/your-model.gguf
+    command: >
+      -m /models/${TURBOQUANT_MODEL:-default-model.gguf}
+      --host 0.0.0.0
+      --port 1235
+      --ctx-size ${TURBOQUANT_CTX:-8192}
+      --n-gpu-layers ${TURBOQUANT_GPU_LAYERS:-99}
+      --flash-attn
+    networks:
+      - sovereign-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:1235/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  # ─── pgvector Postgres (RAG vector store — port 5432) ───────────────
+  pgvector:
+    image: pgvector/pgvector:pg16
+    container_name: aos-pgvector
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ${PG_USER:-aos}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-aos_sovereign}
+      POSTGRES_DB: ${PG_DB:-aos_vectors}
+    volumes:
+      - pgvector-data:/var/lib/postgresql/data
+    networks:
+      - sovereign-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER:-aos} -d ${PG_DB:-aos_vectors}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+# ─── Volumes ──────────────────────────────────────────────────────────
+volumes:
+  aos-data:
+    driver: local
+  pgvector-data:
+    driver: local
+
+# ─── Network ─────────────────────────────────────────────────────────
+networks:
+  sovereign-net:
+    driver: bridge
+    name: sovereign-factory
